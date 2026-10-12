@@ -1,0 +1,144 @@
+; STM32H743IIT6 链接布局：内部 Flash 2 MiB、内部各域 SRAM、外部 SDRAM 32 MiB
+; 本文件只决定段地址、容量和启动初始化行为，不能设置 MPU 或硬件缓存属性
+; 缓存说明对应当前 platform_memory.c，所有 DMA 数据仍须满足外设可达性、对齐和生命周期约束
+; D2 的 SRAM1/2/3 含启动初始化段，Keil 必须定义 DATA_IN_D2_SRAM
+; SystemInit 据此先开启 D2 SRAM 时钟，之后 __main 才可复制 RW 初值与清零 ZI 段
+; UNINIT 区域用于无需加载初值的 ZI 数据，启动时不清零，模块首次读取前必须初始化有效数据及状态
+; 外部 SDRAM 必须先完成 FMC、器件命令和刷新配置，再由业务模块访问或清理内容
+; 仅屏蔽可选段选择器未匹配的 L6314W，其他链接告警继续用于检查容量和布局错误
+
+; 加载区：片内 Flash 起点 0x08000000，最大 2 MiB
+; 承载只读程序及其他初始化执行区的加载镜像，启动代码按链接器表搬运其 RW/代码初值
+; CPU 可从 Flash 读取和执行，缓存是否启用由平台决定，链接区声明不代替缓存配置
+LR_FLASH 0x08000000 0x00200000
+{
+    ; Flash 执行区：与加载区同址，最大 2 MiB，保存只读数据和可执行代码
+    ; RESET 向量排在最前，保留根区与启动初始化表，RO/XO 不需要 SRAM 启动清零
+    ; CPU 原址执行与读取，修改 Flash 后的缓存一致性由执行写入操作的模块负责
+    ER_FLASH 0x08000000 0x00200000
+    {
+        *.o (RESET, +First)
+        *(InRoot$$Sections)
+        .ANY (+RO)
+        .ANY (+XO)
+    }
+
+    ; ITCM 执行区：0x00000000 起共 64 KiB，只接收显式标记的 ITCM_CODE
+    ; 初值保存在 Flash 加载镜像中，由 __main 在进入 main 前复制到紧耦合指令存储器
+    ; CPU 通过 TCM 通路执行，不依赖 AXI 数据缓存，不能将此区作为普通 DMA1/DMA2 缓冲区
+    ER_ITCM 0x00000000 0x00010000
+    {
+        * (ITCM_CODE)
+    }
+
+    ; DTCM 数据区：0x20000000 起共 128 KiB，容纳启动栈、运行库堆及显式 DTCM 数据
+    ; RW 初值由 __main 复制，ZI 启动清零，平台唯一的 48 KiB FreeRTOS ucHeap 也放在此区
+    ; CPU 通过紧耦合数据通路访问，不需要 D-Cache 维护，普通 DMA1/DMA2 与 SDMMC IDMA 不可使用
+    RW_DTCM 0x20000000 0x00020000
+    {
+        * (STACK)
+        * (HEAP)
+        * (.bss.DTCM_DATA)
+        * (.data.DTCM_DATA)
+        * (DTCM_DATA)
+    }
+
+    ; SRAM1 DMA 专用区：0x30000000 起共 80 KiB，UNINIT，不参与启动复制或清零
+    ; 容纳采集 DMA、USART1 发送及波形源条带缓冲，所属模块负责首次使用前初始化及传输期间独占
+    ; MPU 用 128 KiB 区域的前五个 16 KiB 子区覆盖此段，配置为共享、不可缓存、不可执行
+    ; DMA 可达性和对齐仍由驱动保证，UNINIT 本身不会配置 MPU，也不会确保复位后内容有效
+    RW_DMA_NOCACHE 0x30000000 UNINIT 0x00014000
+    {
+        * (.bss.DMA_NOCACHE)
+        * (DMA_NOCACHE)
+    }
+
+    ; SRAM1 常规数据区：0x30014000 起共 48 KiB，与前方 80 KiB DMA 区共同占满 128 KiB SRAM1
+    ; RW 初值由 __main 复制，ZI 启动清零，访问前须由 SystemInit 打开 D2 SRAM1 时钟
+    ; MPU 基础区域将此段配置为非共享、可缓存的 Write-back 普通内存，与前方 DMA 区在 0x30014000 分界
+    RW_SRAM1 0x30014000 0x0000C000
+    {
+        * (.bss.SRAM1_DATA)
+        * (.data.SRAM1_DATA)
+        * (SRAM1_DATA)
+    }
+
+    ; SRAM2 数据区：0x30020000 起共 128 KiB，只接收显式 SRAM2 数据标记
+    ; SystemInit 先打开 D2 SRAM2 时钟，__main 再复制 RW 初值并清零 ZI，CPU 与可达该域的 DMA 可使用
+    ; MPU 显式配置为非共享、可缓存的 Write-back 普通内存，DMA 使用前后须维护缓存
+    RW_SRAM2 0x30020000 0x00020000
+    {
+        * (.bss.SRAM2_DATA)
+        * (.data.SRAM2_DATA)
+        * (SRAM2_DATA)
+    }
+
+    ; SRAM3 数据区：0x30040000 起共 32 KiB，只接收显式 SRAM3 数据标记
+    ; SystemInit 先打开 D2 SRAM3 时钟，__main 再复制 RW 初值并清零 ZI，DMA 使用须核对域访问能力
+    ; MPU 显式配置为非共享、可缓存的 Write-back 普通内存，不能默认获得 DMA 一致性
+    RW_SRAM3 0x30040000 0x00008000
+    {
+        * (.bss.SRAM3_DATA)
+        * (.data.SRAM3_DATA)
+        * (SRAM3_DATA)
+    }
+
+    ; SRAM4 保留数据区：0x38000000 起共 4 KiB，UNINIT，__main 不复制初值也不清零
+    ; 可用于软件复位间保留状态，是否实际保留取决于复位与供电条件，模块必须验证标记和有效性
+    ; 位于 D3 域，MPU 配为可缓存内存，DMA 必须核对对应主设备可达性并维护缓存
+    RW_SRAM4_NOINIT 0x38000000 UNINIT 0x00001000
+    {
+        * (.bss.SRAM4_NOINIT)
+        * (SRAM4_NOINIT)
+    }
+
+    ; SRAM4 常规数据区：0x38001000 起共 60 KiB，与前方保留段共同占满 64 KiB SRAM4
+    ; RW 初值由 __main 复制，ZI 启动清零，普通初始化段不能用于要求保留的复位状态
+    ; CPU 按 MPU 的 Write-back 普通内存属性访问，D3 DMA 使用前须确认可达性并维护缓存
+    RW_SRAM4 0x38001000 0x0000F000
+    {
+        * (.bss.SRAM4_DATA)
+        * (.data.SRAM4_DATA)
+        * (SRAM4_DATA)
+    }
+
+    ; SDRAM 显示区：0xC0000000 起共 8 MiB，接收 UI_DATA，用于 LTDC 多个 RGB565 帧缓冲
+    ; UNINIT 避免启动时访问尚未初始化的 FMC，显示模块须在 SDRAM 可用后清理或绘制实际使用区域
+    ; CPU 和 LTDC 共享该物理窗口，当前整片 SDRAM 的 MPU 属性为普通内存、共享、不可缓存、不可执行
+    ; 不需要 D-Cache 搬运维护，但换帧所有权和写入完成顺序仍由显示服务与 LTDC 中断共同保证
+    RW_SDRAM_UI 0xC0000000 UNINIT 0x00800000
+    {
+        * (.bss.UI_DATA)
+        * (UI_DATA)
+    }
+
+    ; SDRAM 协议区：0xC0800000 起共 2 MiB，只接收 PROTOCOL_DATA，保存协议解码结果等工作数据
+    ; UNINIT 不复制初值也不清零，协议模块须在 FMC/器件初始化完成后建立长度、索引与内容有效范围
+    ; 与显示区同属整片 32 MiB 不可缓存 MPU 区，CPU 可访问，跨任务共享仍须遵守服务层同步和生命周期
+    RW_SDRAM_PROTOCOL 0xC0800000 UNINIT 0x00200000
+    {
+        * (.bss.PROTOCOL_DATA)
+        * (PROTOCOL_DATA)
+    }
+
+    ; SDRAM 采集区：0xC0A00000 起共 22 MiB，只接收 LA_DATA，保存逻辑分析仪边沿数据
+    ; UNINIT 保留区内未使用空间，采集模块在 SDRAM 就绪后初始化控制状态并仅发布已写入的数据范围
+    ; 当前采集搬运采用 CPU 同步复制，此区处于整片共享且不可缓存 SDRAM MPU 区域
+    ; 改用硬件搬运时仍须核对总线可达性与源目标所有权，链接段声明不会自动创建 DMA 通道
+    RW_SDRAM_LA 0xC0A00000 UNINIT 0x01600000
+    {
+        * (.bss.LA_DATA)
+        * (LA_DATA)
+    }
+
+    ; AXI SRAM 数据区：0x24000000 起共 512 KiB，接收显式 AXI 数据以及所有未指定位置的 RW/ZI
+    ; RW 初值由 __main 复制，ZI 启动清零，包含 LVGL 内置静态内存池和 FatFs 对齐扇区中转缓冲
+    ; CPU 与可达 AXI 的 DMA 可访问，MPU 配为 Write-back 可缓存内存，DMA 需要一致性维护
+    ; FatFs 磁盘端口主动清理/失效缓存，其他 DMA 使用者同样必须按缓冲区方向和边界维护缓存
+    RW_AXI_SRAM 0x24000000 0x00080000
+    {
+        * (.bss.AXI_SRAM_DATA)
+        * (.data.AXI_SRAM_DATA)
+        .ANY (+RW +ZI)
+    }
+}

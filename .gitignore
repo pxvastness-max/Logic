@@ -1,0 +1,11 @@
+# Keil build outputs
+/MDK-ARM/Logic/
+/MDK-ARM/.validation/
+/MDK-ARM/DebugConfig/
+/MDK-ARM/*.log
+
+# Keil generated pack files and per-user IDE state
+/MDK-ARM/RTE/
+/MDK-ARM/*.uvoptx
+/MDK-ARM/*.uvguix.px
+/MDK-ARM/*.uvprojx.bak
